@@ -43,10 +43,11 @@ export PASCA_DEVICE_UUID='GPU-対象GPUのUUID'
 - [APIと実用機能](docs/API.md)
 - [実装構成](docs/ARCHITECTURE.md)
 - [測定結果と制約](docs/BENCHMARKS.md)
+- [Gemma 4 12B: llama.cppとのMTP比較](docs/GEMMA4_LLAMA_MTP_COMPARISON.md)
 - [依存物とモデル資産](THIRD_PARTY.md)
 
 開発マイルストーンの生ログ・機器固有の運用手順は、公開リポジトリから除いています。
-数値は既存の実機測定の要約であり、公開版での再測定値ではありません。
+測定ごとの対象バージョン・条件・制約は、各比較資料に記載しています。
 
 ## ライセンス
 
