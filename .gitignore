@@ -1,0 +1,61 @@
+# ビルド生成物・一時ファイル
+/bin/
+/build/
+/dist/
+/tmp/
+/results/*/tmp/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.o
+*.a
+*.so
+*.out
+*.test
+*.prof
+*.tmp
+*.swp
+*.bak
+
+# 重み・評価データ本体（生の測定ログも公開ツリーでは除外）
+/models/
+/data/
+/checkpoints/
+*.safetensors
+*.gguf
+*.pq4m
+*.pt
+*.pth
+*.onnx
+*.bin
+*.f32
+*.npy
+*.npz
+*.kld
+*.tar
+*.tar.gz
+*.zip
+
+# 認証情報・端末固有設定
+.env
+.env.*
+!.env.example
+/secrets/
+/credentials/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.netrc
+.venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# internal/kernels/*.cubin は go:embed に必要なため保存する。
+
+# 配布しない外部資産・測定結果
+/external/
+/results/
