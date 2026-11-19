@@ -52,6 +52,8 @@ const maxPrefixCacheMiB int64 = 1024 * 1024
 
 // options はコマンドの引数です。
 type options struct {
+	mtpLookup          int
+	mtpIntegrated      bool
 	compactVRAM        bool
 	prefillChunk       int
 	prefixCacheMiB     int64
@@ -85,6 +87,8 @@ func main() {
 	flag.StringVar(&opts.addr, "addr", "127.0.0.1:18120", "待ち受けるアドレス（ループバックだけ）")
 	flag.StringVar(&opts.modelName, "model-name", "", "API に出すモデルの名前")
 	flag.StringVar(&opts.deviceUUID, "device-uuid", defaultDeviceUUID, "使う GPU の UUID（省略時 PASCA_DEVICE_UUID）")
+	flag.IntVar(&opts.mtpLookup, "mtp-lookup", 0, "貪欲生成の要求履歴から提案する最大候補数（0・3・7）")
+	flag.BoolVar(&opts.mtpIntegrated, "mtp-integrated", false, "固定3候補・FP16 KV の貪欲 MTP を1本の CUDA Graph で実行する")
 	flag.BoolVar(&opts.compactVRAM, "compact-vram", false, "Gemma4 専用。重みと KV を一括確保し、保存位置の復元幅を入力チャンクに合わせる")
 	flag.IntVar(&opts.prefillChunk, "prefill-chunk", 0, "Gemma4 の入力を区切るトークン数（1〜1024、0 は既定）")
 	flag.IntVar(&opts.maxContext, "max-context", 4096, "プロンプトと生成を合わせた最大のトークン数（KV キャッシュの大きさ）")
@@ -146,6 +150,8 @@ func run(opts options) error {
 	var model generate.Model
 	if opts.architecture == "gemma4" {
 		model, err = gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{
+			MTPLookup:      opts.mtpLookup,
+			MTPIntegrated:  opts.mtpIntegrated,
 			CompactVRAM:    opts.compactVRAM,
 			PrefillChunk:   opts.prefillChunk,
 			MTPGreedyOnly:  opts.mtpGreedyOnly,
@@ -245,6 +251,9 @@ func lookupTokens(tok *tokenizer.Tokenizer, contents ...string) ([]int, error) {
 func resolveOptions(opts *options) error {
 	if opts.architecture == "" {
 		opts.architecture = "lfm3"
+	}
+	if opts.architecture != "gemma4" && (opts.mtpLookup != 0 || opts.mtpIntegrated) {
+		return fmt.Errorf("MTP options require gemma4")
 	}
 	if opts.architecture != "gemma4" && (opts.prefillChunk != 0 || opts.compactVRAM) {
 		return fmt.Errorf("-prefill-chunk and -compact-vram require -architecture gemma4")

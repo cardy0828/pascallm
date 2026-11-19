@@ -11,6 +11,17 @@ import (
 // mtpState は assistant と一括検証用バッファです。メモリ所有者は target Model です。
 // pending は検証済みでも呼出元がまだ入力していないトークンです。論理位置は Feed ごとに 1 だけ進めます。
 type mtpState struct {
+	integrated     *cuda.GraphExec
+	dynamicPrepare *cuda.Function
+	dynamicLocal   *cuda.Function
+	dynamicGlobal  *cuda.Function
+	dynamicCombine *cuda.Function
+	compact        *cuda.Function
+	jointResult    cuda.DevicePtr
+	capturing      bool
+	lookupLimit    int
+	history        []int
+
 	selectionDriven bool
 	greedyOnly      bool
 	selectionBatch  *mtpSelectionBatch
@@ -124,6 +135,10 @@ func (mt *mtpState) close() error {
 		if first == nil {
 			first = err
 		}
+	}
+	if mt.integrated != nil {
+		keep(mt.integrated.Close())
+		mt.integrated = nil
 	}
 	for i, graph := range mt.graphs {
 		if graph != nil {
@@ -300,6 +315,9 @@ func (m *Model) MTPStats() MTPStatistics {
 // 貪欲モードは本体 argmax、選択駆動モードは次回に渡された実トークンと候補を比較します。
 func (m *Model) feedMTP(token int) (int, error) {
 	mt := m.mtp
+	if mt.history != nil {
+		mt.history = append(mt.history, token)
+	}
 	if len(mt.pendingInputs) > 0 {
 		if token == mt.pendingInputs[0] {
 			next, row := mt.pendingOutputs[0], mt.pendingRows[0]
@@ -342,13 +360,36 @@ func (m *Model) feedMTP(token int) (int, error) {
 	}
 	contextBucket := mtpContextBucket(m.position)
 	count := min(mt.chooseDraftCount(contextBucket), m.maxContext-m.position-1)
-	inputs, outputs, draftMS, verifyMS, wallMS, err := mt.draftAndVerify(m, token, count)
+	var inputs, outputs []int
+	var accepted int
+	var draftMS, verifyMS, wallMS float64
+	var err error
+	var proposal []int
+	if mt.history != nil && !mt.selectionDriven && !mt.adaptive {
+		proposal = historyCandidates(mt.history, mt.lookupLimit, m.maxContext-m.position-1)
+	}
+	integrated := len(proposal) == 0 && mt.integrated != nil && m.useGraph && !mt.selectionDriven && !mt.adaptive && count == mtpDraftTokens
+	if len(proposal) > 0 {
+		count = len(proposal)
+		inputs = append([]int{token}, proposal...)
+		started := time.Now()
+		outputs, err = m.verifyMTP(inputs)
+		wallMS = time.Since(started).Seconds() * 1000
+	} else if integrated {
+		inputs, outputs, accepted, wallMS, err = mt.runIntegrated(m, token)
+	} else {
+		inputs, outputs, draftMS, verifyMS, wallMS, err = mt.draftAndVerify(m, token, count)
+	}
 	if err != nil {
 		return 0, err
 	}
-	accepted := 0
-	for accepted < count && inputs[accepted+1] == outputs[accepted] {
-		accepted++
+	if len(proposal) > 0 {
+		mt.stats.LookupBatches++
+	}
+	if !integrated {
+		for accepted < count && inputs[accepted+1] == outputs[accepted] {
+			accepted++
+		}
 	}
 	retainedRows := accepted
 	if mt.selectionDriven {
@@ -374,4 +415,65 @@ func (m *Model) feedMTP(token int) (int, error) {
 		}
 	}
 	return outputs[0], nil
+}
+
+// prepareIntegrated は固定3候補から本体4行の検証、受理判定までを1本のGraphに記録する。
+func (m *Model) prepareIntegrated() error {
+	mt := m.mtp
+	err := loadNamed(m.module, []namedKernel{{&mt.dynamicPrepare, "g4_attention_prepare_rows_dynamic"}, {&mt.dynamicLocal, "g4_verify_local_dynamic"}, {&mt.dynamicGlobal, "g4_verify_global_dynamic"}, {&mt.dynamicCombine, "g4_verify_combine_dynamic"}, {&mt.compact, "g4_accept_three"}})
+	if err != nil {
+		return err
+	}
+	mt.jointResult, err = m.memory.AllocZeroed(int32Bytes * stateCount * mtpVerifyTokens)
+	if err != nil {
+		return err
+	}
+	if err = m.stream.BeginCapture(); err != nil {
+		return err
+	}
+	l := &gpucore.Launcher{Stream: m.stream}
+	mt.enqueueChain(m, l, mtpDraftTokens)
+	mt.capturing = true
+	m.enqueueVerification(l, mtpDraftTokens+1)
+	mt.capturing = false
+	l.Launch(mt.compact, gpucore.Dim1(1), gpucore.Dim1(1), new(cuda.KernelArgs).Pointer(m.prefill.tokens).Pointer(mt.states).Int32(stateCount).Int32(stateArgmax).Pointer(mt.jointResult))
+	graph, err := m.stream.EndCapture()
+	if graph != nil {
+		defer graph.Close()
+	}
+	if l.Err != nil {
+		return l.Err
+	}
+	if err != nil {
+		return err
+	}
+	mt.integrated, err = graph.Instantiate()
+	return err
+}
+
+// runIntegrated は既知のトークンと位置を転送し、Graphの結果を1回だけ同期して読む。
+func (mt *mtpState) runIntegrated(m *Model, token int) ([]int, []int, int, float64, error) {
+	start := time.Now()
+	mt.draft.position = m.position
+	if err := mt.draft.writeInput(token); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	if err := mt.integrated.Launch(m.stream); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	if err := mt.host.CopyFromDeviceAsync(m.stream, mt.jointResult); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	if err := m.stream.Synchronize(); err != nil {
+		return nil, nil, 0, 0, err
+	}
+	v := mt.host.Int32s()
+	const rows = mtpDraftTokens + 1
+	inputs, outputs := make([]int, rows), make([]int, rows)
+	for row := 0; row < rows; row++ {
+		inputs[row] = int(v[row])
+		outputs[row] = int(v[rows+row])
+	}
+	mt.stats.IntegratedBatches++
+	return inputs, outputs, int(v[2*rows]), time.Since(start).Seconds() * 1000, nil
 }

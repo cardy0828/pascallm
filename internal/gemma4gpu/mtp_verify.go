@@ -10,6 +10,10 @@ import (
 // attendVerify は target の各候補位置を通常生成と同じ split attention で検証します。
 // KV は行ごとの位置へ書きますが、各 Q が見るのは自身の位置までなので未来の候補は参照しません。
 func (m *Model) attendVerify(l *gpucore.Launcher, layer *deviceLayer, start, count int) {
+	if m.mtp.capturing {
+		m.attendDynamicVerify(l, layer, count)
+		return
+	}
 	p := &m.prefill
 	mt := m.mtp
 	c := m.config
@@ -55,20 +59,7 @@ func (m *Model) verifyMTP(tokens []int) ([]int, error) {
 // timed が true の場合は検証終了を CUDA event に記録し、候補列の読み戻しも含めて最後に同期します。
 func (m *Model) verifyMTPDevice(count int, timed bool) ([]int, error) {
 	l := &gpucore.Launcher{Stream: m.stream}
-	m.enqueueRows(l, count, len(m.layers), true)
-	last := &m.layers[len(m.layers)-1]
-	m.residualNormRows(l, count, m.prefill.delta, last.postFFNNorm, m.outputNorm, last.outScale)
-	m.gemmRows(l, m.embedding, m.mtp.logits, count)
-	l.Launch(m.kernels.softcap, gpucore.Dim1(gpucore.CeilDiv(count*m.config.VocabSize, threadsPerBlock)), gpucore.Dim1(threadsPerBlock),
-		new(cuda.KernelArgs).Pointer(m.mtp.logits).Int32(int32(count*m.config.VocabSize)).Float32(float32(m.config.FinalLogitSoftcap)))
-	// argmax の作業領域は同じ stream 内で順に使い回します。各行の結果だけ別の状態に残します。
-	original := m.buffers
-	for row := 0; row < count; row++ {
-		m.buffers.logits = m.mtp.logits + cuda.DevicePtr(row*float32Bytes*m.config.VocabSize)
-		m.buffers.state = m.mtp.states + cuda.DevicePtr(row*int32Bytes*stateCount)
-		m.argmax(l)
-	}
-	m.buffers = original
+	m.enqueueVerification(l, count)
 	if l.Err != nil {
 		return nil, l.Err
 	}
@@ -108,4 +99,47 @@ func (m *Model) DebugMTPVerify(tokens []int) ([][]float32, error) {
 		rows[i] = values[i*m.config.VocabSize : (i+1)*m.config.VocabSize]
 	}
 	return rows, nil
+}
+
+// attendDynamicVerify は固定形状の検証をGPU上の位置から実行する。
+func (m *Model) attendDynamicVerify(l *gpucore.Launcher, layer *deviceLayer, count int) {
+	p := &m.prefill
+	mt := m.mtp
+	c := m.config
+	hd := layer.config.HeadDim
+	kv := layer.config.KVHeads
+	prepare := new(cuda.KernelArgs).Pointer(p.qkv).Pointer(layer.qNorm).Pointer(layer.kNorm).Pointer(layer.ropeInverse).
+		Float32(float32(c.NormEps)).Pointer(mt.draft.buffers.state).Int32(int32(hd)).Int32(int32(c.NumHeads)).Int32(int32(kv)).
+		Int32(int32(layer.valueOffset)).Int32(int32(layer.qkvWidth)).Pointer(p.query).Pointer(layer.keyCache).Pointer(layer.valueCache).Int32(int32(layer.ringSize))
+	l.Launch(mt.dynamicPrepare, gpucore.Dim2(m.prepareVectorBlocks(layer), count), gpucore.Dim1(threadsPerBlock), prepare)
+	kernel := mt.dynamicGlobal
+	if layer.config.Sliding {
+		kernel = mt.dynamicLocal
+	}
+	body := new(cuda.KernelArgs).Pointer(p.query).Pointer(layer.keyCache).Pointer(layer.valueCache).Pointer(mt.draft.buffers.state).
+		Int32(int32(layer.window)).Int32(int32(layer.ringSize)).Int32(int32(kv)).Int32(int32(c.NumHeads / kv)).Float32(attentionScale).
+		Pointer(mt.partial).Int32(int32(c.NumHeads)).Int32(int32(mt.partialStride))
+	grid := cuda.Dim3{X: uint32(c.NumHeads / layer.groupSize), Y: uint32(layer.maxSplits), Z: uint32(count)}
+	l.Launch(kernel, grid, gpucore.Dim1(threadsPerBlock), body)
+	combine := new(cuda.KernelArgs).Pointer(mt.partial).Pointer(mt.draft.buffers.state).Int32(int32(layer.window)).Int32(int32(layer.maxSplits)).
+		Int32(int32(hd)).Int32(int32(layer.groupSize)).Int32(int32(c.NumHeads)).Pointer(p.actQ).Pointer(p.actInfo).Int32(int32(mt.partialStride))
+	l.Launch(mt.dynamicCombine, gpucore.Dim2(layer.queryWidth(c.NumHeads)/threadsPerBlock, count), gpucore.Dim1(threadsPerBlock), combine)
+}
+
+// enqueueVerification はcount行の本体処理とargmaxをストリームに積む。
+func (m *Model) enqueueVerification(l *gpucore.Launcher, count int) {
+	m.enqueueRows(l, count, len(m.layers), true)
+	last := &m.layers[len(m.layers)-1]
+	m.residualNormRows(l, count, m.prefill.delta, last.postFFNNorm, m.outputNorm, last.outScale)
+	m.gemmRows(l, m.embedding, m.mtp.logits, count)
+	l.Launch(m.kernels.softcap, gpucore.Dim1(gpucore.CeilDiv(count*m.config.VocabSize, threadsPerBlock)), gpucore.Dim1(threadsPerBlock),
+		new(cuda.KernelArgs).Pointer(m.mtp.logits).Int32(int32(count*m.config.VocabSize)).Float32(float32(m.config.FinalLogitSoftcap)))
+	// argmax の作業領域は同じ stream 内で順に使い回します。各行の結果だけ別の状態に残します。
+	original := m.buffers
+	for row := 0; row < count; row++ {
+		m.buffers.logits = m.mtp.logits + cuda.DevicePtr(row*float32Bytes*m.config.VocabSize)
+		m.buffers.state = m.mtp.states + cuda.DevicePtr(row*int32Bytes*stateCount)
+		m.argmax(l)
+	}
+	m.buffers = original
 }

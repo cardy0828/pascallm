@@ -23,6 +23,7 @@ The server runs one model per process and generates one response at a time. It s
 
 ## Documentation
 
+- [Greedy MTP options and workload benchmarks](docs/GEMMA4_MTP_TUNING.en.md)
 - [Build, convert weights, and validate the installation](docs/GETTING_STARTED.en.md)
 - [API, generation settings, and conversation reuse](docs/API.en.md)
 - [Engine architecture](docs/ARCHITECTURE.en.md)

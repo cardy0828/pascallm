@@ -22,3 +22,5 @@ FP32 keys improved a long-context diagnostic KL metric but reduced speed; evalua
 | New question with the same system message | 980.37 | 757.52 |
 
 The cache used 1,024 MiB and eight snapshot slots. Prompt time includes saving and restoring KV. The first visit pays a save cost; revisiting a cached prompt can substantially reduce latency.
+
+[Greedy MTP options and workload benchmarks](GEMMA4_MTP_TUNING.en.md)

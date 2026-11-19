@@ -39,7 +39,7 @@ import (
 // 既定値と、eval の合格の基準です。
 const (
 	defaultDeviceUUID = ""
-	defaultPQ4    = "./data/gemma4-12b-qat.pq4m"
+	defaultPQ4        = "./data/gemma4-12b-qat.pq4m"
 	// llama.cpp との比較の基準です。どちらも活性値を int8 にするため完全には一致せず、CPU の参照実装（int8）と
 	// llama.cpp の差（KL 平均 0.03、上位 1 位一致 95%）と同じ程度になります。
 	minimumTop1Agreement = 0.90
@@ -49,6 +49,7 @@ const (
 
 // options はコマンドライン引数です。
 type options struct {
+	mtpIntegrated bool
 	compactVRAM   bool
 	prefillChunk  int
 	kvCache       string
@@ -76,6 +77,7 @@ func parseOptions() (options, error) {
 	flag.StringVar(&opts.mode, "mode", "eval", "eval・bench・prefill・profile のどれか")
 	flag.StringVar(&opts.pq4Path, "pq4", defaultPQ4, "Gemma 4 の .pq4m")
 	flag.StringVar(&opts.deviceUUID, "device-uuid", defaultDeviceUUID, "使う GPU の UUID（省略時 PASCA_DEVICE_UUID）")
+	flag.BoolVar(&opts.mtpIntegrated, "mtp-integrated", false, "固定3候補・FP16 KV の貪欲 MTP を1本の CUDA Graph で実行する")
 	flag.BoolVar(&opts.compactVRAM, "compact-vram", false, "Gemma4 専用。重みと KV を一括確保し、保存位置の復元幅を入力チャンクに合わせる")
 	flag.IntVar(&opts.prefillChunk, "prefill-chunk", 0, "Gemma4 の入力を区切るトークン数（1〜1024、0 は既定）")
 	flag.IntVar(&opts.maxContext, "max-context", 8192, "扱える最大の位置数")
@@ -483,6 +485,7 @@ func run(opts options) error {
 	defer base.Close()
 	started := time.Now()
 	model, err := gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{
+		MTPIntegrated:  opts.mtpIntegrated,
 		CompactVRAM:    opts.compactVRAM,
 		PrefillChunk:   opts.prefillChunk,
 		KVCache:        opts.kvCache,

@@ -179,6 +179,12 @@ func (e *Engine) Generate(ctx context.Context, request Request, handler TokenHan
 		return result, err
 	}
 
+	if chooser.mode == chooseGreedyGPU {
+		if lookup, ok := e.model.(interface{ SetLookupHistory([]int) }); ok {
+			lookup.SetLookupHistory(request.Prompt[:last])
+			defer lookup.SetLookupHistory(nil)
+		}
+	}
 	next, err := e.step(request.Prompt[last], chooser, false)
 	if err != nil {
 		return result, e.fail(err)

@@ -41,6 +41,7 @@ export PASCA_DEVICE_UUID='GPU-対象GPUのUUID'
 
 ## ドキュメント
 
+- [貪欲 MTP の追加設定と用途別の実測](docs/GEMMA4_MTP_TUNING.md)
 - [導入・変換・検証](docs/GETTING_STARTED.md)
 - [APIと実用機能](docs/API.md)
 - [実装構成](docs/ARCHITECTURE.md)

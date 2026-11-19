@@ -967,3 +967,59 @@ extern "C" __global__ void __launch_bounds__(kGemmThreads) g4_prefill_gemm(const
                                                          int tokens, int input_block_shift) {
     gemm_pq4_tile<128, 64, 8, 4, 8>(packed, scales, act_q, act_info, out, rows, blocks_per_row, tokens, input_block_shift);
 }
+
+#if !defined(G4_KEY_FP32) && !defined(G4_VALUE_FP32)
+extern "C" {
+// Graphの再生ごとに変わる検証開始位置をGPU上のdraft_state[1]から取得する。
+__global__ void g4_attention_prepare_rows_dynamic(const float* __restrict__ qkv, const float* __restrict__ q_norm,
+                                          const float* __restrict__ k_norm,
+                                          const float* __restrict__ inverse_frequency, float eps, const int* draft_state,
+                                          int head_dim, int num_heads, int kv_heads, int value_offset, int qkv_width,
+                                          float* __restrict__ query_out, G4Key* __restrict__ key_cache,
+                                          G4Value* __restrict__ value_cache, int ring_size) {
+    const int vector = blockIdx.x * kG4Warps + threadIdx.x / kWarpSize;
+    if (vector >= num_heads + 2 * kv_heads) return;
+    const size_t row = blockIdx.y;
+    g4_prepare_vector(qkv + row * qkv_width, q_norm, k_norm, inverse_frequency, eps,
+                      draft_state[1] + static_cast<int>(row), head_dim, num_heads, kv_heads, value_offset,
+                      query_out + row * num_heads * head_dim, key_cache, value_cache, ring_size, vector);
+}
+// Graphの再生ごとに変わる検証開始位置をGPU上のdraft_state[1]から取得する。
+__global__ void g4_verify_local_dynamic(const float* query,const G4Key* keys,const G4Value* values,const int* draft_state,
+    int window,int ring_size,int kv_heads,int heads_per_kv,float scale,float* partial,int num_heads,int partial_stride) {
+    const int row=blockIdx.z;
+    const int state[4]={0,draft_state[1]+row,0,0};
+    g4_attention_decode_body<256,2,16>(query+static_cast<size_t>(row)*num_heads*256,keys,values,state,
+        window,ring_size,kv_heads,heads_per_kv,scale,partial+static_cast<size_t>(row)*partial_stride);
+}
+// Graphの再生ごとに変わる検証開始位置をGPU上のdraft_state[1]から取得する。
+__global__ void g4_verify_global_dynamic(const float* query,const G4Key* keys,const G4Value* values,const int* draft_state,
+    int window,int ring_size,int kv_heads,int heads_per_kv,float scale,float* partial,int num_heads,int partial_stride) {
+    const int row=blockIdx.z;
+    const int state[4]={0,draft_state[1]+row,0,0};
+    g4_attention_decode_body<512,4,8>(query+static_cast<size_t>(row)*num_heads*512,keys,values,state,
+        window,ring_size,kv_heads,heads_per_kv,scale,partial+static_cast<size_t>(row)*partial_stride);
+}
+// Graphの再生ごとに変わる検証開始位置をGPU上のdraft_state[1]から取得する。
+__global__ void g4_verify_combine_dynamic(const float* partial,const int* draft_state,int window,int max_splits,
+    int head_dim,int group_size,int num_heads,int8_t* q,ActBlockInfo* info,int partial_stride) {
+    const int row=blockIdx.y;
+    const int state[4]={0,draft_state[1]+row,0,0};
+    const int width=head_dim*num_heads;
+    g4_combine_body(partial+static_cast<size_t>(row)*partial_stride,state,window,max_splits,head_dim,group_size,
+        num_heads,q+static_cast<size_t>(row)*width,info+static_cast<size_t>(row)*(width/kQuantBlock));
+}
+// 固定3候補の連続一致長と各位置のIDをGPUでまとめる。1スレッドで実行する。
+__global__ void g4_accept_three(const int* inputs, const int* states, int stride, int argmax_index, int* result) {
+    int accepted = 0;
+    for (int row = 0; row < 4; ++row) {
+        result[row] = inputs[row];
+        result[4 + row] = states[row * stride + argmax_index];
+    }
+    while (accepted < 3 && inputs[accepted + 1] == states[accepted * stride + argmax_index]) {
+        ++accepted;
+    }
+    result[8] = accepted;
+}
+}
+#endif

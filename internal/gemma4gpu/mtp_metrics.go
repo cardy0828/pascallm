@@ -24,6 +24,8 @@ type MTPDistribution struct {
 // MTPStatistics は候補列の検証結果です。受理は本体 argmax との一致で、API が返したトークン数とは異なります。
 // ByContext は順に <1024 / 1024..4095 / 4096..8191 / >=8192 の生成位置です。
 type MTPStatistics struct {
+	IntegratedBatches  int  `json:"integrated_batches,omitempty"`
+	LookupBatches      int  `json:"lookup_batches,omitempty"`
 	SelectionDriven    bool `json:"selection_driven"`
 	SelectionRejected  int  `json:"selection_rejected"`
 	SelectionTruncated int  `json:"selection_truncated"`

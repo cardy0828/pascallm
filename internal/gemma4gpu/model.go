@@ -88,6 +88,9 @@ type Options struct {
 	KVCache string
 	// MTPPath は任意の Gemma4 12B assistant Q4_0 GGUF です。空なら先読みしません。
 	MTPPath string
+	// MTPIntegrated は固定3候補を1つの CUDA Graph で検証する。MTPLookup は履歴候補の最大数（0・3・7）。
+	MTPIntegrated bool
+	MTPLookup     int
 	// MTPDraftTokens は固定候補数（0 は 3）、MTPAdaptive は候補数の自動調整です。
 	MTPDraftTokens int
 	MTPAdaptive    bool
@@ -301,9 +304,20 @@ func Open(path string, opts Options) (model *Model, err error) {
 	if opts.PrefillChunk < 1 || opts.PrefillChunk > localRingSlack {
 		return nil, fmt.Errorf("gemma4gpu: prefill chunk must be between 1 and %d, got %d", localRingSlack, opts.PrefillChunk)
 	}
+	if opts.MTPLookup != 0 && opts.MTPLookup != 3 && opts.MTPLookup != 7 {
+		return nil, fmt.Errorf("mtp-lookup must be 0, 3 or 7")
+	}
+	if opts.MTPIntegrated || opts.MTPLookup != 0 {
+		if opts.MTPPath == "" || opts.MTPAdaptive || (opts.MTPDraftTokens != 0 && opts.MTPDraftTokens != mtpDraftTokens) {
+			return nil, fmt.Errorf("integrated and lookup modes require an assistant and fixed three-token drafting")
+		}
+	}
 	storage, err := resolveKVStorage(opts.KVCache)
 	if err != nil {
 		return nil, err
+	}
+	if opts.MTPIntegrated && storage.name != "fp16" {
+		return nil, fmt.Errorf("integrated MTP requires fp16 KV")
 	}
 	weights, err := gemma4.OpenWeights(path)
 	if err != nil {
@@ -388,6 +402,12 @@ func Open(path string, opts Options) (model *Model, err error) {
 	if opts.MTPPath != "" {
 		if m.mtp, err = m.loadAssistant(opts.MTPPath); err != nil {
 			return nil, err
+		}
+		m.mtp.lookupLimit = opts.MTPLookup
+		if opts.MTPIntegrated {
+			if err = m.prepareIntegrated(); err != nil {
+				return nil, err
+			}
 		}
 		m.mtp.greedyOnly = opts.MTPGreedyOnly
 		if err = m.ConfigureMTP(opts.MTPDraftTokens, opts.MTPAdaptive); err != nil {

@@ -27,3 +27,5 @@ MTP checks deterministic draft candidates against the target sampler's actual se
 Send the complete messages on every request. When host caching is enabled with a positive prefix-cache budget, the engine can restore the longest matching token prefix within that model instance. It saves a boundary at 256 tokens and a stable boundary before generation when eligible. Least recently used snapshots are evicted. The byte budget covers saved KV payload and tokens. Saving a new snapshot costs time.
 
 One GPU worker processes accepted requests FIFO, with a queue of up to 16. A full queue returns HTTP 503 or an SSE error if streaming has begun. `timings.queue_ms` measures time waiting for the worker. `prompt_ms` includes cache save and restore.
+
+[Greedy MTP options and workload benchmarks](GEMMA4_MTP_TUNING.en.md)
