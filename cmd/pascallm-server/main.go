@@ -52,6 +52,8 @@ const maxPrefixCacheMiB int64 = 1024 * 1024
 
 // options はコマンドの引数です。
 type options struct {
+	compactVRAM        bool
+	prefillChunk       int
 	prefixCacheMiB     int64
 	prefixCacheEntries int
 	mtpGreedyOnly      bool
@@ -83,6 +85,8 @@ func main() {
 	flag.StringVar(&opts.addr, "addr", "127.0.0.1:18120", "待ち受けるアドレス（ループバックだけ）")
 	flag.StringVar(&opts.modelName, "model-name", "", "API に出すモデルの名前")
 	flag.StringVar(&opts.deviceUUID, "device-uuid", defaultDeviceUUID, "使う GPU の UUID（省略時 PASCA_DEVICE_UUID）")
+	flag.BoolVar(&opts.compactVRAM, "compact-vram", false, "Gemma4 専用。重みと KV を一括確保し、保存位置の復元幅を入力チャンクに合わせる")
+	flag.IntVar(&opts.prefillChunk, "prefill-chunk", 0, "Gemma4 の入力を区切るトークン数（1〜1024、0 は既定）")
 	flag.IntVar(&opts.maxContext, "max-context", 4096, "プロンプトと生成を合わせた最大のトークン数（KV キャッシュの大きさ）")
 	flag.BoolVar(&opts.enableThinking, "enable-thinking", true, "chat_template_kwargs.enable_thinking の既定値")
 	flag.BoolVar(&opts.gpuCandidates, "gpu-candidates", true, "選び方の候補を GPU で絞る（false なら毎回 logits 全体を CPU に移す。比較用）")
@@ -141,7 +145,17 @@ func run(opts options) error {
 
 	var model generate.Model
 	if opts.architecture == "gemma4" {
-		model, err = gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{MTPGreedyOnly: opts.mtpGreedyOnly, KVCache: opts.kvCache, DeviceUUID: opts.deviceUUID, MaxContext: opts.maxContext, MTPPath: opts.mtpPath, MTPDraftTokens: opts.mtpDraft, MTPAdaptive: opts.mtpAdaptive})
+		model, err = gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{
+			CompactVRAM:    opts.compactVRAM,
+			PrefillChunk:   opts.prefillChunk,
+			MTPGreedyOnly:  opts.mtpGreedyOnly,
+			KVCache:        opts.kvCache,
+			DeviceUUID:     opts.deviceUUID,
+			MaxContext:     opts.maxContext,
+			MTPPath:        opts.mtpPath,
+			MTPDraftTokens: opts.mtpDraft,
+			MTPAdaptive:    opts.mtpAdaptive,
+		})
 	} else {
 		model, err = lfm3gpu.Open(opts.pq4Path, lfm3gpu.Options{DeviceUUID: opts.deviceUUID, MaxContext: opts.maxContext})
 	}
@@ -231,6 +245,9 @@ func lookupTokens(tok *tokenizer.Tokenizer, contents ...string) ([]int, error) {
 func resolveOptions(opts *options) error {
 	if opts.architecture == "" {
 		opts.architecture = "lfm3"
+	}
+	if opts.architecture != "gemma4" && (opts.prefillChunk != 0 || opts.compactVRAM) {
+		return fmt.Errorf("-prefill-chunk and -compact-vram require -architecture gemma4")
 	}
 	if opts.mtpPath != "" && opts.architecture != "gemma4" {
 		return fmt.Errorf("-mtp requires -architecture gemma4")

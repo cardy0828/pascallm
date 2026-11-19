@@ -11,3 +11,15 @@ func TestSnapshotRejectInvalid(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactRestoreWindow は小さいリングが上書きされる境界で復元可否を切り替えることを検査する。
+func TestCompactRestoreWindow(t *testing.T) {
+	m := Model{restoreSlack: 128, savedPosition: 1024, position: 1152}
+	if !m.CanRestore() {
+		t.Fatal("saved prefix should fit at the boundary")
+	}
+	m.position++
+	if m.CanRestore() {
+		t.Fatal("overwritten prefix still restorable")
+	}
+}

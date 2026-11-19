@@ -1,5 +1,7 @@
 # ライセンスの適用範囲と第三者の資産
 
+[English](THIRD_PARTY.en.md)
+
 ## PascaLLM 本体
 
 PascaLLM の独自のソースコードと文書は [MIT License](LICENSE) で提供します。

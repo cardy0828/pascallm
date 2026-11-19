@@ -1132,31 +1132,29 @@ __global__ void quantize_rows(const float* __restrict__ values, int n, int8_t* _
     quantize_warp(values[row * n + index], index / kQuantBlock, q + row * n, info + row * (n / kQuantBlock));
 }
 
-// gemm_pq4 は、複数トークンの行列積 out[t][r] = Σ W[r] · x[t] を計算します。W は PQ4、x は int8 化した活性値です。
-// 1 ブロックの計算は gemv_pq4 と同じ式です（d_w · (d_a·Σq_w·q_a − 8·d_a·Σq_a) をブロックごとに足す）。
-//
-// 分担: 1 スレッドブロックが重み 64 行 × 128 トークンを受け持ちます。スレッド (rx = 番号 % 16, ty = 番号 / 16) が
-// 行 rx + 16i（i = 0〜3）と トークン ty + 16j（j = 0〜7）の 32 個を計算します。ワープ内の 16 レーンが連続した 16 行を
-// 持つため、結果の書き込み（[トークン][行]）がまとまります。K 方向は 4 ブロック（128 要素）ずつ、重み（4bit のまま）・
-// 係数・活性値・付帯情報を共有メモリに置いてから計算します。重みの 4bit の取り出しは 1 行につき 1 回で、8 トークンに使います。
-// PQ8 は gemv_pq4 と同じく、重みのブロック b が活性値のブロック b >> input_block_shift を使います。
-// blocks_per_row は 1 行あたりの重みのブロック数です。
-// 起動: grid = (rows / 64, ceil(tokens / 128))、block = 256。rows は 64 の倍数、blocks_per_row は 4 の倍数。
-// 例: rows = 15360（W1・W3）、blocks_per_row = 64（hidden 2048）、tokens = 512 なら grid = (240, 4)
-__global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict__ packed,
+}  // extern "C"
+
+// gemm_pq4_tile は PQ4/PQ8 の重みと int8 活性値のブロック積を FP32 で同じ順に累積する。
+// 例として基準形状は64行×128トークン、Gemma 4の入力処理では128行×64トークンを使う。
+// 行数・重みのブロック数はそれぞれタイル行数・K方向の段幅で割り切れる形状を渡す。
+template <int kGemmTileRows, int kGemmTileTokens, int kGemmThreadRows, int kGemmThreadTokens, int kGemmStageBlocks>
+__device__ __forceinline__ void gemm_pq4_tile(const int4* __restrict__ packed,
                                                          const __half* __restrict__ scales,
                                                          const int8_t* __restrict__ act_q,
                                                          const ActBlockInfo* __restrict__ act_info,
                                                          float* __restrict__ out, int rows, int blocks_per_row,
                                                          int tokens, int input_block_shift) {
+    constexpr int rowGroups = kGemmTileRows / kGemmThreadRows;
+    static_assert(rowGroups == 16, "16 row groups and 16 token groups");
+    static_assert(kGemmThreadTokens * 16 == kGemmTileTokens, "token tile size");
     __shared__ int4 weight_tile[kGemmStageBlocks][kGemmTileRows];
     __shared__ float scale_tile[kGemmStageBlocks][kGemmTileRows];
     __shared__ int4 act_tile[kGemmStageBlocks][kGemmTileTokens][2];
     __shared__ ActBlockInfo info_tile[kGemmStageBlocks][kGemmTileTokens];
 
     const int thread = threadIdx.x;
-    const int rx = thread % kGemmRowGroups;
-    const int ty = thread / kGemmRowGroups;
+    const int rx = thread % rowGroups;
+    const int ty = thread / rowGroups;
     const int first_row = blockIdx.x * kGemmTileRows;
     const int first_token = blockIdx.y * kGemmTileTokens;
     const int4* act_vectors = reinterpret_cast<const int4*>(act_q);  // 1 ブロック = int4 2 個（32 バイト）
@@ -1170,7 +1168,7 @@ __global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict_
     }
 
     for (int stage = 0; stage < blocks_per_row; stage += kGemmStageBlocks) {
-        // 重みと係数: 64 行 × kGemmStageBlocks ブロック。連続した番号のスレッドが、同じ行の連続したブロックを読む。
+        // 重みと係数: kGemmTileRows 行 × kGemmStageBlocks ブロック。連続した番号のスレッドが、同じ行の連続したブロックを読む。
         for (int i = thread; i < kGemmTileRows * kGemmStageBlocks; i += kGemmThreads) {
             const int row = i / kGemmStageBlocks;
             const int block = i % kGemmStageBlocks;
@@ -1212,7 +1210,7 @@ __global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict_
             float weight_scale[kGemmThreadRows];
 #pragma unroll
             for (int i = 0; i < kGemmThreadRows; ++i) {
-                const int4 w = weight_tile[block][rx + i * kGemmRowGroups];
+                const int4 w = weight_tile[block][rx + i * rowGroups];
                 low[i][0] = low_nibbles(w.x);
                 low[i][1] = low_nibbles(w.y);
                 low[i][2] = low_nibbles(w.z);
@@ -1221,11 +1219,11 @@ __global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict_
                 high[i][1] = high_nibbles(w.y);
                 high[i][2] = high_nibbles(w.z);
                 high[i][3] = high_nibbles(w.w);
-                weight_scale[i] = scale_tile[block][rx + i * kGemmRowGroups];
+                weight_scale[i] = scale_tile[block][rx + i * rowGroups];
             }
 #pragma unroll
             for (int j = 0; j < kGemmThreadTokens; ++j) {
-                const int token = ty + j * kGemmRowGroups;
+                const int token = ty + j * rowGroups;
                 const int4 a0 = act_tile[block][token][0];
                 const int4 a1 = act_tile[block][token][1];
                 const ActBlockInfo info = info_tile[block][token];
@@ -1250,13 +1248,24 @@ __global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict_
 
 #pragma unroll
     for (int j = 0; j < kGemmThreadTokens; ++j) {
-        const int token = first_token + ty + j * kGemmRowGroups;
+        const int token = first_token + ty + j * rowGroups;
         if (token >= tokens) continue;
 #pragma unroll
         for (int i = 0; i < kGemmThreadRows; ++i) {
-            out[static_cast<size_t>(token) * rows + first_row + rx + i * kGemmRowGroups] = acc[i][j];
+            out[static_cast<size_t>(token) * rows + first_row + rx + i * rowGroups] = acc[i][j];
         }
     }
+}
+
+extern "C" {
+// 既存の64行×128トークン形状を同じABIで呼ぶ。
+__global__ void __launch_bounds__(kGemmThreads) gemm_pq4(const int4* __restrict__ packed,
+                                                         const __half* __restrict__ scales,
+                                                         const int8_t* __restrict__ act_q,
+                                                         const ActBlockInfo* __restrict__ act_info,
+                                                         float* __restrict__ out, int rows, int blocks_per_row,
+                                                         int tokens, int input_block_shift) {
+    gemm_pq4_tile<kGemmTileRows, kGemmTileTokens, kGemmThreadRows, kGemmThreadTokens, kGemmStageBlocks>(packed, scales, act_q, act_info, out, rows, blocks_per_row, tokens, input_block_shift);
 }
 
 // short_conv_quantize_rows は、short_conv_quantize を区切りのトークン（位置 start_position から tokens 個）に

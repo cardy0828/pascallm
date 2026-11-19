@@ -126,7 +126,7 @@ func (m *Model) launchCandidates(params gpucore.CandidateParams, accepted int32)
 // SaveState は、現在の位置を保存します（前に保存した位置は捨てる）。
 //
 // KV キャッシュは位置ごとに書くため、位置を戻すだけで過去に戻せます。ただし局所の層は輪状バッファなので、
-// 保存してから localRingSlack 個より多く進むと、保存した位置から見える k・v が上書きされ、戻せなくなります
+// 保存してから輪状領域の余裕より多く進むと、保存した位置から見える k・v が上書きされ、戻せなくなります
 // （CanRestore が false になる）。
 // 例: Prefill(prompt[:n]) の後に SaveState() → SavedPosition() は n
 func (m *Model) SaveState() error {
@@ -138,13 +138,13 @@ func (m *Model) SaveState() error {
 func (m *Model) SavedPosition() int { return m.savedPosition }
 
 // CanRestore は、RestoreState で保存した位置に戻せるかを返します。
-// 例: 保存した位置 1000、現在の位置 1800 -> true（進んだのは 800 個で、余裕 1024 以下）
+// 例: 保存した位置 1000、現在の位置 1800 -> true（進んだのは 800 個で、既定の余裕 1024 以下）
 func (m *Model) CanRestore() bool {
 	highWater := m.position
 	if m.mtp != nil {
 		highWater = max(highWater, m.mtp.highWater)
 	}
-	return m.savedPosition != noSavedState && highWater-m.savedPosition <= localRingSlack
+	return m.savedPosition != noSavedState && highWater-m.savedPosition <= m.restoreSlack
 }
 
 // RestoreState は、SaveState で保存した位置に戻します。保存した位置はそのまま残ります。
@@ -155,7 +155,7 @@ func (m *Model) RestoreState() error {
 	}
 	if !m.CanRestore() {
 		return fmt.Errorf("gemma4gpu: cannot restore position %d from position %d (more than %d tokens ahead)",
-			m.savedPosition, m.position, localRingSlack)
+			m.savedPosition, m.position, m.restoreSlack)
 	}
 	m.invalidateMTP()
 	m.position = m.savedPosition

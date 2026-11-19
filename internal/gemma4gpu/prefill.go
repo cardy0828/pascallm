@@ -8,37 +8,41 @@ import (
 	"github.com/cardy0828/pascallm/internal/pq4"
 )
 
-// この file は入力処理（prefill）です。プロンプトの複数のトークンを、区切り（最大 PrefillChunkTokens 個）ごとに
+// Prefill はプロンプトを起動時に指定したトークン数ごとに区切り、各区切りを
 // まとめて処理し、KV キャッシュを、1 トークンずつ Feed した場合と同じ場所に書きます。
 // 語彙出力は計算しません。プロンプトの最後のトークンは Feed・FeedCandidates で入れて、次のトークンを選びます。
 //
-// attention は、トークンごとに 1 ブロックが見える範囲の K・V を読みます（生成用と同じ計算）。
+// attention では、各ブロックが 1 トークンの複数の query ヘッドを処理し、見える範囲の K/V を共有します。
 // 複数のトークンで K・V の読み出しを共有する形にはしていません（文脈が長いと attention の割合が増える）。
 
-// PrefillChunkTokens は、Prefill が 1 回の区切りでまとめて処理する最大のトークン数です。
-// 局所の層の輪状バッファの余裕（localRingSlack）以下であること。
+// PrefillChunkTokens は起動時に区切りを省略した場合の行数です。
 const PrefillChunkTokens = 512
 
-// prefillKernelSet は入力処理のカーネルです。
+// PrefillChunkSize は現在の入力処理の区切りを返します。生成側の取消確認も同じ単位です（例 512）。
+func (m *Model) PrefillChunkSize() int { return m.prefillRows }
+
+// 少数行の行列積では処理行数に応じて 4・8 トークンのタイルを使います。
 const smallGemmLimit = 32
 const smallGemmTileTokens = 4
 const mtpGemmTileTokens = 8
 
 // prefillKernelSet は入力処理で使うカーネルを保持します。
 type prefillKernelSet struct {
-	gemmSmall        *cuda.Function
-	gemmSmall8       *cuda.Function
-	embedRows        *cuda.Function
-	residualNormRows *cuda.Function
-	gemm             *cuda.Function
-	prepareRows      *cuda.Function
-	localRows        *cuda.Function
-	globalRows       *cuda.Function
-	quantizeRows     *cuda.Function
-	geluMulRows      *cuda.Function
+	localRing, global8 *cuda.Function
+	wide               *cuda.Function // FP16 KVのGemma 4で使う、128出力行×64トークンのプリフィル用行列積。
+	gemmSmall          *cuda.Function
+	gemmSmall8         *cuda.Function
+	embedRows          *cuda.Function
+	residualNormRows   *cuda.Function
+	gemm               *cuda.Function
+	prepareRows        *cuda.Function
+	localRows          *cuda.Function
+	globalRows         *cuda.Function
+	quantizeRows       *cuda.Function
+	geluMulRows        *cuda.Function
 }
 
-// prefillBuffers は、1 区切り（最大 PrefillChunkTokens 個）の作業領域です。行はトークンごとに連続して並びます。
+// prefillBuffers は 1 区切りまたは MTP の候補検証に使う作業領域です。行はトークンごとに連続して並びます。
 type prefillBuffers struct {
 	tokens    cuda.DevicePtr // [chunk] int32
 	hidden    cuda.DevicePtr // [chunk][hidden] float32
@@ -51,11 +55,8 @@ type prefillBuffers struct {
 	gateUp    cuda.DevicePtr // [chunk][2 × ffn] float32
 }
 
-// preparePrefill は、入力処理のカーネルを読み込み、作業領域と固定メモリを確保します（Open から呼ぶ）。
+// preparePrefill は入力処理のカーネルを読み込みます（Open から呼ぶ）。
 func (m *Model) preparePrefill() error {
-	if PrefillChunkTokens > localRingSlack {
-		return fmt.Errorf("gemma4gpu: PrefillChunkTokens %d is larger than the ring slack %d", PrefillChunkTokens, localRingSlack)
-	}
 	set := &m.prefillKernels
 	err := loadNamed(m.module, []namedKernel{
 		{&set.embedRows, "g4_embed_rows"},
@@ -72,6 +73,23 @@ func (m *Model) preparePrefill() error {
 	if err != nil {
 		return err
 	}
+	// 実測したGemma 4 12BのFP16 KV構成で専用タイルを使う。
+	const gemma12BHidden, gemma12BFFN, gemma12BLayers = 3840, 15360, 48
+	if m.kvCache == "fp16" && m.config.HiddenSize == gemma12BHidden && m.config.FeedForwardSize == gemma12BFFN && len(m.layers) == gemma12BLayers {
+		err = loadNamed(m.module, []namedKernel{
+			{&set.wide, "g4_prefill_gemm"},
+			{&set.localRing, "g4_prefill_local_ring"},
+			{&set.global8, "g4_prefill_global8"},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// allocatePrefill は区切りの行数と MTP に必要な行数に合わせて GPU 作業領域を確保する。
+func (m *Model) allocatePrefill() error {
 	config := m.config
 	hidden := config.HiddenSize
 	maxQKV, maxQuery := 0, 0
@@ -80,7 +98,8 @@ func (m *Model) preparePrefill() error {
 		maxQuery = max(maxQuery, m.layers[index].queryWidth(config.NumHeads))
 	}
 	maxInput := max(hidden, config.FeedForwardSize, maxQuery)
-	rows := PrefillChunkTokens
+	// MTP 検証は通常の入力の区切りが小さくても最大 8 行を使います。
+	rows := max(m.prefillRows, mtpVerifyTokens)
 	p := &m.prefill
 	sizes := []struct {
 		target *cuda.DevicePtr
@@ -103,8 +122,7 @@ func (m *Model) preparePrefill() error {
 		}
 		*entry.target = pointer
 	}
-	m.hostPrefillTokens, err = cuda.AllocHost(int32Bytes * rows)
-	return err
+	return nil
 }
 
 // Prefill は tokens を位置 Position() から順にまとめて処理し、位置を len(tokens) 進めます。
@@ -126,8 +144,8 @@ func (m *Model) Prefill(tokens []int) error {
 			return fmt.Errorf("gemma4gpu: token %d is outside the vocabulary (size %d)", token, m.config.VocabSize)
 		}
 	}
-	for offset := 0; offset < len(tokens); offset += PrefillChunkTokens {
-		end := min(offset+PrefillChunkTokens, len(tokens))
+	for offset := 0; offset < len(tokens); offset += m.prefillRows {
+		end := min(offset+m.prefillRows, len(tokens))
 		if _, _, err := m.prefillChunk(tokens[offset:end], nil); err != nil {
 			return err
 		}
@@ -135,11 +153,11 @@ func (m *Model) Prefill(tokens []int) error {
 	return nil
 }
 
-// MeasurePrefill は、tokens（PrefillChunkTokens 個以下）を Prefill と同じく 1 区切りで処理し、カーネルの種類ごとの
+// MeasurePrefill は、tokens（設定したトークン数以下）を Prefill と同じく 1 区切りで処理し、カーネルの種類ごとの
 // GPU 時間（マイクロ秒）と起動回数を返します。位置は len(tokens) 進みます（確認用）。
 func (m *Model) MeasurePrefill(tokens []int) (map[string]float64, map[string]int, error) {
-	if len(tokens) == 0 || len(tokens) > PrefillChunkTokens {
-		return nil, nil, fmt.Errorf("gemma4gpu: MeasurePrefill needs 1 to %d tokens, got %d", PrefillChunkTokens, len(tokens))
+	if len(tokens) == 0 || len(tokens) > m.prefillRows {
+		return nil, nil, fmt.Errorf("gemma4gpu: MeasurePrefill needs 1 to %d tokens, got %d", m.prefillRows, len(tokens))
 	}
 	if m.position+len(tokens) > m.maxContext {
 		return nil, nil, fmt.Errorf("gemma4gpu: prefill of %d tokens at position %d exceeds MaxContext %d", len(tokens), m.position, m.maxContext)
@@ -149,7 +167,7 @@ func (m *Model) MeasurePrefill(tokens []int) (map[string]float64, map[string]int
 	return m.prefillChunk(tokens, timer)
 }
 
-// prefillChunk は、最大 PrefillChunkTokens 個のトークンを 1 区切りとして処理し、終わるまで待ちます。
+// prefillChunk は、設定した上限までのトークンを 1 区切りとして処理し、終わるまで待ちます。
 // timer が nil でなければ、カーネルごとの時間を測って返します。
 func (m *Model) prefillChunk(tokens []int, timer *gpucore.KernelTimer) (map[string]float64, map[string]int, error) {
 	host := m.hostPrefillTokens.Int32s()
@@ -195,6 +213,10 @@ func (m *Model) enqueueRows(l *gpucore.Launcher, count, layerCount int, verify b
 
 	for index := 0; index < layerCount; index++ {
 		layer := &m.layers[index]
+		if !verify && m.prefillKernels.wide != nil && index == len(m.layers)-1 {
+			m.prefillLastKV(l, layer, count)
+			return
+		}
 		m.gemmRows(l, layer.qkv, p.qkv, count)
 		if verify {
 			m.attendVerify(l, layer, start, count)
@@ -228,6 +250,13 @@ func (m *Model) residualNormRows(l *gpucore.Launcher, count int, delta, deltaWei
 
 // gemmRows は、out[t] = matrix · (トークン t の int8 化済みの活性値) を count トークン分積みます。
 func (m *Model) gemmRows(l *gpucore.Launcher, matrix gpucore.Matrix, out cuda.DevicePtr, count int) {
+	const wideRows, wideTokens, stageBlocks = 128, 64, 8
+	if count > smallGemmLimit && m.prefillKernels.wide != nil && matrix.Rows%wideRows == 0 && matrix.WeightBlocks%stageBlocks == 0 {
+		args := new(cuda.KernelArgs).Pointer(matrix.Packed).Pointer(matrix.Scales).Pointer(m.prefill.actQ).Pointer(m.prefill.actInfo).Pointer(out).
+			Int32(int32(matrix.Rows)).Int32(int32(matrix.WeightBlocks)).Int32(int32(count)).Int32(int32(matrix.InputBlockShift))
+		l.LaunchLabeled(matrix.Label("g4_prefill_gemm"), m.prefillKernels.wide, gpucore.Dim2(matrix.Rows/wideRows, gpucore.CeilDiv(count, wideTokens)), gpucore.Dim1(gpucore.GemmThreads), args)
+		return
+	}
 	if count > smallGemmLimit {
 		gpucore.Gemm(l, m.prefillKernels.gemm, matrix, m.prefill.actQ, m.prefill.actInfo, out, count)
 		return
@@ -236,7 +265,7 @@ func (m *Model) gemmRows(l *gpucore.Launcher, matrix gpucore.Matrix, out cuda.De
 		Pointer(m.prefill.actQ).Pointer(m.prefill.actInfo).Pointer(out).
 		Int32(int32(matrix.Rows)).Int32(int32(matrix.WeightBlocks)).Int32(int32(count)).Int32(int32(matrix.InputBlockShift))
 	kernel, tile := m.prefillKernels.gemmSmall, smallGemmTileTokens
-	if count > smallGemmTileTokens && count <= mtpGemmTileTokens {
+	if count > smallGemmTileTokens && (count <= mtpGemmTileTokens || m.prefillKernels.wide != nil) {
 		kernel = m.prefillKernels.gemmSmall8
 		tile = mtpGemmTileTokens
 	}
@@ -265,24 +294,32 @@ func (m *Model) attendRows(l *gpucore.Launcher, layer *deviceLayer, start, count
 		Int32(int32(start)).Int32(int32(layer.window)).Int32(int32(layer.ringSize)).Int32(int32(kvHeads)).
 		Int32(int32(config.NumHeads / kvHeads)).Int32(int32(config.NumHeads)).Float32(attentionScale).Pointer(p.attention)
 	kernel := m.prefillKernels.globalRows
+	grid := gpucore.Dim2(config.NumHeads/layer.groupSize, count)
+	const sharedQueryHeads = 8
 	if layer.config.Sliding {
 		kernel = m.prefillKernels.localRows
+		if m.prefillKernels.localRing != nil && layer.ringSize&(layer.ringSize-1) == 0 {
+			kernel = m.prefillKernels.localRing
+		}
+	} else if m.prefillKernels.global8 != nil && (config.NumHeads/kvHeads)%sharedQueryHeads == 0 {
+		kernel = m.prefillKernels.global8
+		grid = gpucore.Dim2(count, config.NumHeads/sharedQueryHeads)
 	}
-	l.Launch(kernel, gpucore.Dim2(config.NumHeads/layer.groupSize, count), gpucore.Dim1(threadsPerBlock), body)
+	l.Launch(kernel, grid, gpucore.Dim1(threadsPerBlock), body)
 
 	width := layer.queryWidth(config.NumHeads)
 	l.Launch(m.prefillKernels.quantizeRows, gpucore.Dim2(width/threadsPerBlock, count), gpucore.Dim1(threadsPerBlock),
 		new(cuda.KernelArgs).Pointer(p.attention).Int32(int32(width)).Pointer(p.actQ).Pointer(p.actInfo))
 }
 
-// DebugPrefillHidden は、tokens（PrefillChunkTokens 個以下）を現在の位置から 1 区切りとして、最初の layers 層だけ
+// DebugPrefillHidden は、tokens（設定したトークン数以下）を現在の位置から 1 区切りとして、最初の layers 層だけ
 // 処理し、その時点の残差の流れ（[トークン][hidden] を並べたもの）を返します。位置は進めません。
 // 生成の経路（DebugHidden）と層ごとに比べるための確認用です。layers は全層より少なくしてください
 // （最後の層の後の加算は、入力処理では行わないため）。
 // 例: DebugPrefillHidden(tokens[:40], 1) は、40 トークン分の 1 層目の後の hidden
 func (m *Model) DebugPrefillHidden(tokens []int, layers int) ([]float32, error) {
-	if len(tokens) == 0 || len(tokens) > PrefillChunkTokens {
-		return nil, fmt.Errorf("gemma4gpu: DebugPrefillHidden needs 1 to %d tokens, got %d", PrefillChunkTokens, len(tokens))
+	if len(tokens) == 0 || len(tokens) > m.prefillRows {
+		return nil, fmt.Errorf("gemma4gpu: DebugPrefillHidden needs 1 to %d tokens, got %d", m.prefillRows, len(tokens))
 	}
 	if layers < 0 || layers >= len(m.layers) {
 		return nil, fmt.Errorf("gemma4gpu: DebugPrefillHidden needs 0 to %d layers, got %d", len(m.layers)-1, layers)
@@ -307,4 +344,23 @@ func (m *Model) DebugPrefillHidden(tokens []int, layers int) ([]float32, error) 
 		return nil, err
 	}
 	return hidden, nil
+}
+
+// prefillLastKV は最後の層のQを除いた重みを既存のK/V行列として扱い、KVを本来の位置に書く。
+// 例として最終層でVがKの射影を使う場合も、正規化とRoPEはそれぞれ従来通りに行う。
+func (m *Model) prefillLastKV(l *gpucore.Launcher, layer *deviceLayer, count int) {
+	matrix := layer.qkv
+	queryWidth := layer.queryWidth(m.config.NumHeads)
+	blocks := matrix.WeightBlocks * queryWidth
+	matrix.Packed += cuda.DevicePtr(blocks * pq4.BlockBytes)
+	matrix.Scales += cuda.DevicePtr(blocks * float16Bytes)
+	matrix.Rows -= queryWidth
+	p := &m.prefill
+	m.gemmRows(l, matrix, p.qkv, count)
+	kvHeads := layer.config.KVHeads
+	args := new(cuda.KernelArgs).Pointer(p.qkv).Pointer(layer.qNorm).Pointer(layer.kNorm).Pointer(layer.ropeInverse).
+		Float32(float32(m.config.NormEps)).Int32(int32(m.position)).Int32(int32(layer.config.HeadDim)).Int32(0).Int32(int32(kvHeads)).
+		Int32(int32(layer.valueOffset - queryWidth)).Int32(int32(matrix.Rows)).
+		Pointer(p.query).Pointer(layer.keyCache).Pointer(layer.valueCache).Int32(int32(layer.ringSize))
+	l.Launch(m.prefillKernels.prepareRows, gpucore.Dim2(gpucore.CeilDiv(2*kvHeads, warpsPerBlock), count), gpucore.Dim1(threadsPerBlock), args)
 }

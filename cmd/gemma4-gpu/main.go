@@ -49,6 +49,8 @@ const (
 
 // options はコマンドライン引数です。
 type options struct {
+	compactVRAM   bool
+	prefillChunk  int
 	kvCache       string
 	mtpDraft      int
 	mtpAdaptive   bool
@@ -74,6 +76,8 @@ func parseOptions() (options, error) {
 	flag.StringVar(&opts.mode, "mode", "eval", "eval・bench・prefill・profile のどれか")
 	flag.StringVar(&opts.pq4Path, "pq4", defaultPQ4, "Gemma 4 の .pq4m")
 	flag.StringVar(&opts.deviceUUID, "device-uuid", defaultDeviceUUID, "使う GPU の UUID（省略時 PASCA_DEVICE_UUID）")
+	flag.BoolVar(&opts.compactVRAM, "compact-vram", false, "Gemma4 専用。重みと KV を一括確保し、保存位置の復元幅を入力チャンクに合わせる")
+	flag.IntVar(&opts.prefillChunk, "prefill-chunk", 0, "Gemma4 の入力を区切るトークン数（1〜1024、0 は既定）")
 	flag.IntVar(&opts.maxContext, "max-context", 8192, "扱える最大の位置数")
 	flag.StringVar(&opts.kldPath, "kld", "", "llama-perplexity --kl-divergence-base のファイル（トークン列と基準）")
 	flag.IntVar(&opts.chunks, "chunks", 1, "eval で比べる区切りの数")
@@ -425,7 +429,7 @@ func runPrefill(model *gemma4gpu.Model, base *llamakld.File, opts options) error
 }
 
 // runProfile は、カーネルの種類ごとの GPU 時間を出します。-context 個を入れた後の 1 トークンと、
-// 入力処理 1 区切り（最大 512 個）の 2 つです。
+// 入力処理 1 区切り（-prefill-chunk の行数まで）の 2 つです。
 func runProfile(model *gemma4gpu.Model, base *llamakld.File, opts options) error {
 	tokens, err := contextTokens(base, model.Config().BOSTokenID, opts.context)
 	if err != nil {
@@ -455,7 +459,7 @@ func runProfile(model *gemma4gpu.Model, base *llamakld.File, opts options) error
 	}
 	emit(map[string]any{"event": "profile_token", "context": opts.context, "microseconds": microseconds, "launches": launches})
 
-	chunk := tokens[:min(len(tokens), gemma4gpu.PrefillChunkTokens)]
+	chunk := tokens[:min(len(tokens), model.PrefillChunkSize())]
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := model.Reset(); err != nil {
 			return err
@@ -478,7 +482,16 @@ func run(opts options) error {
 	}
 	defer base.Close()
 	started := time.Now()
-	model, err := gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{KVCache: opts.kvCache, DeviceUUID: opts.deviceUUID, MaxContext: opts.maxContext, MTPPath: opts.mtpPath, MTPDraftTokens: opts.mtpDraft, MTPAdaptive: opts.mtpAdaptive})
+	model, err := gemma4gpu.Open(opts.pq4Path, gemma4gpu.Options{
+		CompactVRAM:    opts.compactVRAM,
+		PrefillChunk:   opts.prefillChunk,
+		KVCache:        opts.kvCache,
+		DeviceUUID:     opts.deviceUUID,
+		MaxContext:     opts.maxContext,
+		MTPPath:        opts.mtpPath,
+		MTPDraftTokens: opts.mtpDraft,
+		MTPAdaptive:    opts.mtpAdaptive,
+	})
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ package gpucore
 
 import (
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/cardy0828/pascallm/internal/cuda"
@@ -36,6 +37,8 @@ const stagingBytes = 64 << 20
 
 // Memory は、GPU メモリの確保をまとめて記録し、Close で一括して解放します。
 type Memory struct {
+	// pack は Open の大容量一括確保の間だけ設定します。残りの通常確保は個別です。
+	pack        *allocationGroup
 	stream      *cuda.Stream
 	staging     *cuda.HostBuffer
 	allocations []cuda.DevicePtr
@@ -54,10 +57,67 @@ func NewMemory(stream *cuda.Stream) (*Memory, error) {
 // TotalBytes は、確保した GPU メモリの合計を返します（報告用）。
 func (m *Memory) TotalBytes() int64 { return m.totalBytes }
 
+// allocationGroup は CUDA と同じ 256 バイト境界で、確保前に数えた順にテンソルを置きます。
+type allocationGroup struct {
+	base         cuda.DevicePtr
+	size, offset int
+	planning     bool
+}
+
+// Packed は build の GPU 確保と転送を 1 領域にまとめます。例えば重みと KV を別々に確保した場合の隙間を減らします。
+// build は同じ順序で 2 回呼びます。1 回目の Alloc は配置だけを数え、CopyBytes とゼロ初期化は 2 回目に行います。
+// build 内では Memory の操作だけを使い、GPU カーネルの起動やホスト側の資源確保を行いません。
+func (m *Memory) Packed(build func() error) error {
+	group := &allocationGroup{planning: true}
+	m.pack = group
+	defer func() { m.pack = nil }()
+	if err := build(); err != nil {
+		return err
+	}
+	group.size = group.offset
+	base, err := cuda.Alloc(group.size)
+	if err != nil {
+		return fmt.Errorf("gpucore: packing %d bytes: %w", group.size, err)
+	}
+	m.allocations = append(m.allocations, base)
+	m.totalBytes += int64(group.size)
+	group.base = base
+	group.planning = false
+	group.offset = 0
+	if err := build(); err != nil {
+		return err
+	}
+	if group.offset != group.size {
+		return fmt.Errorf("gpucore: packed allocation changed size from %d to %d", group.size, group.offset)
+	}
+	return nil
+}
+
+// next は size バイト分の整列済み領域を返します。見積もり時はアドレスを使用しません。
+func (g *allocationGroup) next(size int) (cuda.DevicePtr, error) {
+	const alignment = 256
+	padding := (alignment - g.offset%alignment) % alignment
+	if g.offset > math.MaxInt-padding || size > math.MaxInt-g.offset-padding {
+		return 0, fmt.Errorf("gpucore: packed allocation too large")
+	}
+	start := g.offset + padding
+	g.offset = start + size
+	if g.planning {
+		return 0, nil
+	}
+	if g.offset > g.size {
+		return 0, fmt.Errorf("gpucore: packed allocation exceeds %d bytes", g.size)
+	}
+	return g.base + cuda.DevicePtr(start), nil
+}
+
 // Alloc は GPU メモリを size バイト確保し、記録します。例: Alloc(4 * 3840) は float32 3840 個分
 func (m *Memory) Alloc(size int) (cuda.DevicePtr, error) {
 	if size <= 0 {
 		return 0, fmt.Errorf("gpucore: cannot allocate %d bytes", size)
+	}
+	if m.pack != nil {
+		return m.pack.next(size)
 	}
 	pointer, err := cuda.Alloc(size)
 	if err != nil {
@@ -74,6 +134,9 @@ func (m *Memory) AllocZeroed(size int) (cuda.DevicePtr, error) {
 	if err != nil {
 		return 0, err
 	}
+	if m.pack != nil && m.pack.planning {
+		return pointer, nil
+	}
 	if err := cuda.MemsetBytes(m.stream, pointer, 0, size); err != nil {
 		return 0, err
 	}
@@ -82,6 +145,9 @@ func (m *Memory) AllocZeroed(size int) (cuda.DevicePtr, error) {
 
 // CopyBytes は、ホストのバイト列 data を GPU の destination へコピーし、完了まで待ちます。
 func (m *Memory) CopyBytes(destination cuda.DevicePtr, data []byte) error {
+	if m.pack != nil && m.pack.planning {
+		return nil
+	}
 	buffer := m.staging.Bytes()
 	for offset := 0; offset < len(data); offset += len(buffer) {
 		chunk := copy(buffer, data[offset:])

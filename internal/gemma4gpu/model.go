@@ -68,15 +68,20 @@ const (
 
 // localRingSlack は、局所の層の輪状バッファを窓より大きくする分（スロット数）です。
 //
-//   - 入力処理は PrefillChunkTokens 個の k・v をまとめて書いてから attention を計算します。区切りの最初のトークンが
-//     見る位置（窓の分）を、同じ区切りの後ろのトークンが上書きしないために、余裕は PrefillChunkTokens 以上が必要です。
+//   - 入力処理は設定した区切りの k・v をまとめて書いてから attention を計算します。区切りの最初のトークンが
+//     見る位置（窓の分）を、同じ区切りの後ろのトークンが上書きしないために、余裕は区切りの長さ以上が必要です。
 //   - RestoreState で保存した位置に戻せるのは、保存してから進んだ位置数が余裕以下のときです。
 //
+// CompactVRAM を選ぶとこの余裕を max(入力チャンク幅, MTP検証行数) に縮めます。
 // 例: 窓 1024、余裕 1024 なら輪は 2048 スロット（12B で 40 層 × 16 MB = 655 MB）
 const localRingSlack = 1024
 
 // Options は GPU 実装の設定です。
 type Options struct {
+	// CompactVRAM は重み・KVを一括確保し、局所 KV の保存点の余裕を入力の区切りに合わせます。
+	CompactVRAM bool
+	// PrefillChunk は同時に処理する入力の行数です。0 は既定値、例は 256。
+	PrefillChunk int
 	// MTPGreedyOnly はサンプリング/文法で従来経路を使う比較設定です。
 	MTPGreedyOnly bool
 	// KVCache は fp16（既定）、k-fp32、fp32（診断用）の格納形式です。
@@ -219,13 +224,15 @@ type activations struct {
 
 // Model は GPU 上の Gemma 4 です。同時に 1 系列だけを扱います。
 type Model struct {
-	kvCache    string
-	keyBytes   int
-	valueBytes int
-	mtp        *mtpState
-	config     *gemma4.Config
-	maxContext int
-	position   int // 次に処理するトークンの位置（ホスト側の写し）
+	kvCache      string
+	keyBytes     int
+	valueBytes   int
+	mtp          *mtpState
+	config       *gemma4.Config
+	maxContext   int
+	prefillRows  int
+	restoreSlack int
+	position     int // 次に処理するトークンの位置（ホスト側の写し）
 	// savedPosition は SaveState で保存した位置です（なければ noSavedState）。
 	savedPosition int
 	useGraph      bool // true なら CUDA Graph を再生し、false ならカーネルを 1 個ずつ起動する
@@ -247,7 +254,7 @@ type Model struct {
 	hostCandidates *cuda.HostBuffer // 候補の受け取り用
 	graph          *cuda.GraphExec
 
-	// 入力処理（prefill.go）のカーネル・作業領域と、トークン番号を送る固定メモリ（int32 × PrefillChunkTokens）です。
+	// 入力処理（prefill.go）のカーネル・作業領域と、トークン番号を送る固定メモリ（int32 × 作業領域の行数）です。
 	prefillKernels    prefillKernelSet
 	prefill           prefillBuffers
 	hostPrefillTokens *cuda.HostBuffer
@@ -288,6 +295,12 @@ func Open(path string, opts Options) (model *Model, err error) {
 	if opts.MaxContext <= 0 {
 		return nil, fmt.Errorf("gemma4gpu: MaxContext must be positive, got %d", opts.MaxContext)
 	}
+	if opts.PrefillChunk == 0 {
+		opts.PrefillChunk = PrefillChunkTokens
+	}
+	if opts.PrefillChunk < 1 || opts.PrefillChunk > localRingSlack {
+		return nil, fmt.Errorf("gemma4gpu: prefill chunk must be between 1 and %d, got %d", localRingSlack, opts.PrefillChunk)
+	}
 	storage, err := resolveKVStorage(opts.KVCache)
 	if err != nil {
 		return nil, err
@@ -307,7 +320,11 @@ func Open(path string, opts Options) (model *Model, err error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Model{kvCache: storage.name, keyBytes: storage.keyBytes, valueBytes: storage.valueBytes, config: weights.Config, maxContext: opts.MaxContext, useGraph: true, savedPosition: noSavedState}
+	m := &Model{kvCache: storage.name, keyBytes: storage.keyBytes, valueBytes: storage.valueBytes, config: weights.Config, maxContext: opts.MaxContext, prefillRows: opts.PrefillChunk, useGraph: true, savedPosition: noSavedState}
+	m.restoreSlack = localRingSlack
+	if opts.CompactVRAM {
+		m.restoreSlack = max(m.prefillRows, mtpVerifyTokens)
+	}
 	// 途中で失敗したら、それまでに確保したものを解放する。
 	defer func() {
 		if err != nil {
@@ -330,10 +347,21 @@ func Open(path string, opts Options) (model *Model, err error) {
 	if m.memory, err = gpucore.NewMemory(m.stream); err != nil {
 		return nil, err
 	}
-	if err = m.uploadWeights(weights); err != nil {
-		return nil, err
+	allocate := func() error {
+		if err := m.uploadWeights(weights); err != nil {
+			return err
+		}
+		if err := m.allocateActivations(); err != nil {
+			return err
+		}
+		return m.allocatePrefill()
 	}
-	if err = m.allocateActivations(); err != nil {
+	if opts.CompactVRAM {
+		err = m.memory.Packed(allocate)
+	} else {
+		err = allocate()
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err = m.preparePrefill(); err != nil {
@@ -343,6 +371,7 @@ func Open(path string, opts Options) (model *Model, err error) {
 		target **cuda.HostBuffer
 		bytes  int
 	}{
+		{&m.hostPrefillTokens, int32Bytes * max(m.prefillRows, mtpVerifyTokens)},
 		{&m.hostState, int32Bytes * stateCount},
 		{&m.hostLogits, float32Bytes * m.config.VocabSize},
 		{&m.hostSeen, m.config.VocabSize},
@@ -453,7 +482,7 @@ func (m *Model) uploadLayer(index int, weights *gemma4.LayerWeights) (deviceLaye
 	}
 	if weights.Config.Sliding {
 		out.window = config.SlidingWindow
-		out.ringSize = config.SlidingWindow + localRingSlack
+		out.ringSize = config.SlidingWindow + m.restoreSlack
 		out.groupSize = localGroupSize
 		out.maxSplits = gpucore.CeilDiv(config.SlidingWindow, minPositionsPerCut)
 	} else {

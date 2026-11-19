@@ -1,5 +1,7 @@
 # API と設定
 
+[English](API.en.md)
+
 `GET /health`、`GET /v1/models`、`POST /v1/chat/completions` に対応します。
 既定は `127.0.0.1:18120`。認証・TLS・インターネット公開の仕組みは含みません。
 
@@ -14,8 +16,9 @@ JSON Schema は対応する構造・型を制約しますが、数値範囲、�
 
 ## Gemma4 の追加設定
 
+- `-prefill-chunk 512` は入力の区切り幅（1〜1,024）。`-compact-vram` で一括確保と局所 KV 復元幅の縮小を有効化。[設定別の測定](GEMMA4_PREFILL.md)
 - `-mtp /path/to/assistant.gguf`: 対応するQ4_0 assistantでMTPを有効化。
-- `-mtp-draft 3`: 固定候補数。1〜7。`-mtp-adaptive` は自動調整。
+- `-mtp-draft 3`: 固定候補数。1〜7。`-mtp-auto` は自動調整。
 - `-mtp-greedy-only`: 比較用。サンプリング・制約付き生成でMTPを使わない。
 - `-kv-cache fp16`: 既定。比較用に k-fp32、診断用に fp32。
 - `-prefix-cache-mib 1024 -prefix-cache-entries 8`: 任意のホストKV保持。既定は無効。

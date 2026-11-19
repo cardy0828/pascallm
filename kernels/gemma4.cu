@@ -240,6 +240,17 @@ __device__ void g4_prepare_vector(const float* __restrict__ qkv, const float* __
     }
 }
 
+// プリフィルで使う KV スロットの求め方。通常経路は任意長のリングに対応する。
+enum class G4Slot { Ring, PowerOfTwoRing, Linear };
+
+// g4_slot はトークン位置を KV スロットに変換する。線形領域の位置は呼び出し側の上限検査済み。
+template <G4Slot mode>
+__device__ __forceinline__ int g4_slot(int position, int ring_size) {
+    if (mode == G4Slot::Linear) return position;
+    if (mode == G4Slot::PowerOfTwoRing) return position & (ring_size - 1);
+    return position % ring_size;
+}
+
 // g4_attend_range は、kGroup 個の query ヘッド（同じ KV ヘッドを使う）について、位置 [begin, end) に対する
 // attention の途中結果を求めます。スレッドブロック（256 スレッド）の全スレッドで呼びます。
 //
@@ -255,7 +266,7 @@ __device__ void g4_prepare_vector(const float* __restrict__ qkv, const float* __
 // 256 スレッドは「位置 kPositions 個 × 次元の区分 kSegments 個」に分かれ、1 区分は 16 次元です
 // （局所: 16 位置 × 16 区分、全文脈: 8 位置 × 32 区分。共有メモリを小さくして同時実行数を増やす）。
 // query は [kGroup][kHeadDim] の FP32、kv_offset は KV キャッシュの 1 スロットの中での KV ヘッドの位置です。
-template <int kHeadDim, int kGroup, int kPositions>
+template <int kHeadDim, int kGroup, int kPositions, G4Slot slotMode = G4Slot::Ring>
 __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __restrict__ key_cache,
                                 const G4Value* __restrict__ value_cache, int kv_offset, int kv_width, int ring_size,
                                 int begin, int end, float scale, float (&acc)[kGroup][kHeadDim / kG4Threads],
@@ -264,7 +275,8 @@ __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __
     constexpr int kSegmentDims = kHeadDim / kSegments;
     constexpr int kDimsPerThread = kHeadDim / kG4Threads;
     constexpr int kLoadsPerRow = kHeadDim / kG4HalvesPerLoad;  // 1 位置を読む uint4 の数
-    constexpr int kKeyStride = kHeadDim + kG4KeyPadding;
+    // 全文脈プリフィルの K は uint4 でまとめて共有メモリに置く。FP16 の 8 要素で 16 バイト境界を保つ。
+    constexpr int kKeyStride = kHeadDim + (slotMode == G4Slot::Linear ? kG4HalvesPerLoad : kG4KeyPadding);
     static_assert(kSegmentDims % 2 == 0, "half2 単位で区分を処理する");
     static_assert(kGroup <= kG4Warps && kPositions <= kWarpSize, "ワープ h がヘッド h、レーンが位置を受け持つ");
     __shared__ float query_tile[kGroup][kHeadDim];
@@ -302,7 +314,7 @@ __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __
             const int column = (i % (kHeadDim / key_elements_per_load)) * key_elements_per_load;
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (slot < count) {
-                const size_t offset = static_cast<size_t>((chunk + slot) % ring_size) * kv_width + kv_offset + column;
+                const size_t offset = static_cast<size_t>(g4_slot<slotMode>(chunk + slot, ring_size)) * kv_width + kv_offset + column;
                 packed = __ldg(reinterpret_cast<const uint4*>(key_cache + offset));
             }
             const unsigned* words = reinterpret_cast<const unsigned*>(&packed);
@@ -315,7 +327,7 @@ __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __
             const int column = (i % (kHeadDim / value_elements_per_load)) * value_elements_per_load;
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (slot < count) {
-                const size_t offset = static_cast<size_t>((chunk + slot) % ring_size) * kv_width + kv_offset + column;
+                const size_t offset = static_cast<size_t>(g4_slot<slotMode>(chunk + slot, ring_size)) * kv_width + kv_offset + column;
                 packed = __ldg(reinterpret_cast<const uint4*>(value_cache + offset));
             }
             *reinterpret_cast<uint4*>(&value_tile[slot][column]) = packed;
@@ -329,14 +341,18 @@ __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __
             uint4 value = make_uint4(0, 0, 0, 0);
             if (slot < count) {
                 const size_t offset =
-                    static_cast<size_t>((chunk + slot) % ring_size) * kv_width + kv_offset + column;
+                    static_cast<size_t>(g4_slot<slotMode>(chunk + slot, ring_size)) * kv_width + kv_offset + column;
                 key = __ldg(reinterpret_cast<const uint4*>(key_cache + offset));
                 value = __ldg(reinterpret_cast<const uint4*>(value_cache + offset));
             }
-            const unsigned* key_words = reinterpret_cast<const unsigned*>(&key);
+            if (slotMode == G4Slot::Linear) {
+                *reinterpret_cast<uint4*>(&key_tile[slot][column]) = key;
+            } else {
+                const unsigned* key_words = reinterpret_cast<const unsigned*>(&key);
 #pragma unroll
-            for (int w = 0; w < 4; ++w) {
-                *reinterpret_cast<unsigned*>(&key_tile[slot][column + 2 * w]) = key_words[w];
+                for (int w = 0; w < 4; ++w) {
+                    *reinterpret_cast<unsigned*>(&key_tile[slot][column + 2 * w]) = key_words[w];
+                }
             }
             *reinterpret_cast<uint4*>(&value_tile[slot][column]) = value;
         }
@@ -392,13 +408,20 @@ __device__ void g4_attend_range(const float* __restrict__ query, const G4Key* __
 #pragma unroll
             for (int k = 0; k < kDimsPerThread; ++k) acc[h][k] *= factor;
         }
-        for (int p = 0; p < count; ++p) {
+        // 全8位置が有効なタイルではループを展開する。末尾の端数は有効な位置だけを同じ順序で加算する。
+        auto accumulate_position = [&](int p) {
 #pragma unroll
             for (int k = 0; k < kDimsPerThread; ++k) {
                 const float v = g4_load_value(value_tile[p][thread * kDimsPerThread + k]);
 #pragma unroll
                 for (int h = 0; h < kGroup; ++h) acc[h][k] += weights[h][p] * v;
             }
+        };
+        if (slotMode == G4Slot::Linear && count == kPositions) {
+#pragma unroll
+            for (int p = 0; p < kPositions; ++p) accumulate_position(p);
+        } else {
+            for (int p = 0; p < count; ++p) accumulate_position(p);
         }
     }
     __syncthreads();
@@ -453,7 +476,7 @@ __device__ void g4_attention_decode_body(const float* __restrict__ query, const 
 // （位置 start_position + t）の query ヘッド g × kGroup から kGroup 個を受け持ち、見える範囲を分けずに計算して、
 // 正規化した出力を out（[トークン][num_heads × kHeadDim]、FP32）に書きます。
 // KV キャッシュには g4_attention_prepare_rows が区切りの分まで書き終えている必要があります。
-template <int kHeadDim, int kGroup, int kPositions>
+template <int kHeadDim, int kGroup, int kPositions, G4Slot slotMode = G4Slot::Ring>
 __device__ void g4_attention_rows_body(const float* __restrict__ query, const G4Key* __restrict__ key_cache,
                                        const G4Value* __restrict__ value_cache, int start_position, int window,
                                        int ring_size, int kv_heads, int heads_per_kv, int num_heads, float scale,
@@ -461,15 +484,16 @@ __device__ void g4_attention_rows_body(const float* __restrict__ query, const G4
     constexpr int kDimsPerThread = kHeadDim / kG4Threads;
     __shared__ float head_max[kGroup];
     __shared__ float head_total[kGroup];
-    const int group = blockIdx.x;
-    const size_t row = blockIdx.y;
+    // 全文脈の専用カーネルは隣接行を grid.x に並べ、同じ K/V をキャッシュから読みやすくする。
+    const int group = slotMode == G4Slot::Linear ? blockIdx.y : blockIdx.x;
+    const size_t row = slotMode == G4Slot::Linear ? blockIdx.x : blockIdx.y;
     const int position = start_position + static_cast<int>(row);
     const int first = window > 0 ? max(0, position - window + 1) : 0;
     const int kv_head = group * kGroup / heads_per_kv;
     const size_t row_offset = row * num_heads * kHeadDim + group * kGroup * kHeadDim;
 
     float acc[kGroup][kDimsPerThread];
-    g4_attend_range<kHeadDim, kGroup, kPositions>(query + row_offset, key_cache, value_cache, kv_head * kHeadDim,
+    g4_attend_range<kHeadDim, kGroup, kPositions, slotMode>(query + row_offset, key_cache, value_cache, kv_head * kHeadDim,
                                                   kv_heads * kHeadDim, ring_size, first, position + 1, scale, acc,
                                                   head_max, head_total);
 #pragma unroll
@@ -732,6 +756,28 @@ __global__ void __launch_bounds__(kG4Threads) g4_attention_global_rows(
                                        heads_per_kv, num_heads, scale, out);
 }
 
+#if !defined(G4_KEY_FP32) && !defined(G4_VALUE_FP32)
+// 入力の局所 attention。例えば 2048 スロットのリングをビットマスクで参照する。
+// 起動側はスロット数が 2 の累乗のときだけこのカーネルを選ぶ。
+__global__ void __launch_bounds__(kG4Threads) g4_prefill_local_ring(
+    const float* __restrict__ query, const G4Key* __restrict__ key_cache, const G4Value* __restrict__ value_cache,
+    int start_position, int window, int ring_size, int kv_heads, int heads_per_kv, int num_heads, float scale,
+    float* __restrict__ out) {
+    g4_attention_rows_body<256, 2, 16, G4Slot::PowerOfTwoRing>(
+        query, key_cache, value_cache, start_position, window, ring_size, kv_heads, heads_per_kv, num_heads, scale, out);
+}
+
+// 入力の全文脈 attention。8 query ヘッドで 1 回の K/V 読み込みを共有する。
+// grid は (入力行数, ヘッド数 / 8)。各行から見える履歴は常に ring_size 内に収まる。
+__global__ void __launch_bounds__(kG4Threads) g4_prefill_global8(
+    const float* __restrict__ query, const G4Key* __restrict__ key_cache, const G4Value* __restrict__ value_cache,
+    int start_position, int window, int ring_size, int kv_heads, int heads_per_kv, int num_heads, float scale,
+    float* __restrict__ out) {
+    g4_attention_rows_body<512, 8, 8, G4Slot::Linear>(
+        query, key_cache, value_cache, start_position, window, ring_size, kv_heads, heads_per_kv, num_heads, scale, out);
+}
+#endif
+
 }  // extern "C"
 
 // g4_gemm_small は少数トークンの行列積です。1 warp が 4 行 x 最大 4 トークンを担当し、
@@ -910,4 +956,14 @@ __global__ void g4_mtp_chain_next(int* state, int* tokens, int index) {
     state[0] = state[2];
     state[1] -= 1;
 }
+}
+
+// 128出力行×64トークンを処理し、Kを8量子化ブロックずつ共有メモリへ送る。
+extern "C" __global__ void __launch_bounds__(kGemmThreads) g4_prefill_gemm(const int4* __restrict__ packed,
+                                                         const __half* __restrict__ scales,
+                                                         const int8_t* __restrict__ act_q,
+                                                         const ActBlockInfo* __restrict__ act_info,
+                                                         float* __restrict__ out, int rows, int blocks_per_row,
+                                                         int tokens, int input_block_shift) {
+    gemm_pq4_tile<128, 64, 8, 4, 8>(packed, scales, act_q, act_info, out, rows, blocks_per_row, tokens, input_block_shift);
 }

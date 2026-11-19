@@ -1,5 +1,7 @@
 # PascaLLM
 
+[English](README.en.md)
+
 Pascal（sm_61）向けの LLM 推論エンジンと、量子化形式 PQ4 の開発プロジェクトです。
 Go と CUDA Driver API を使い、GTX 1080 Ti で LFM3 1.7B と Gemma 4 12B を検証しています。
 
@@ -42,6 +44,7 @@ export PASCA_DEVICE_UUID='GPU-対象GPUのUUID'
 - [導入・変換・検証](docs/GETTING_STARTED.md)
 - [APIと実用機能](docs/API.md)
 - [実装構成](docs/ARCHITECTURE.md)
+- [Gemma 4 のプレフィルと最大コンテキスト](docs/GEMMA4_PREFILL.md)
 - [測定結果と制約](docs/BENCHMARKS.md)
 - [Gemma 4 12B: llama.cppとのMTP比較](docs/GEMMA4_LLAMA_MTP_COMPARISON.md)
 - [依存物とモデル資産](THIRD_PARTY.md)

@@ -16,6 +16,9 @@ import (
 // PrefillChunkTokens は、Prefill が 1 回の区切りでまとめて処理する最大のトークン数です。
 const PrefillChunkTokens = 512
 
+// PrefillChunkSize は入力処理の区切りを返します。LFM3 は 512 個ずつ処理します。
+func (m *Model) PrefillChunkSize() int { return PrefillChunkTokens }
+
 // 入力処理のカーネルの寸法です（kernels/lfm3.cu の kGemm*・kPrefill* と合わせる）。
 const (
 	gemmTileRows             = 64  // gemm_pq4 の 1 ブロックが受け持つ重みの行数

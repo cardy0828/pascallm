@@ -1,5 +1,9 @@
 # 測定結果
 
+[English](BENCHMARKS.en.md)
+
+[Gemma 4 のプレフィル比較](GEMMA4_PREFILL.md) に、4K〜64K の入力処理速度と最大長の検証条件を掲載しています。
+
 ## llama.cppとの比較
 
 [Gemma 4 12BのMTP比較](GEMMA4_LLAMA_MTP_COMPARISON.md)に、2026-11-17の測定条件、通常/MTPの速度、入力処理時間、出力差と制約を掲載しています。

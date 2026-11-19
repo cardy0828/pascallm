@@ -1,5 +1,7 @@
 # Gemma 4 12B: llama.cppとのMTP比較
 
+[English](GEMMA4_LLAMA_MTP_COMPARISON.en.md)
+
 2026-11-17にGTX 1080 Tiで測定しました。この条件では、MTPありのPascaLLMは比較対象のllama.cppに対して1.21〜1.51倍の生成速度でした。特定のビルドと少数の入力による測定であり、他のGPU・モデル・バージョンでの性能を保証するものではありません。
 
 ## 比較対象と条件

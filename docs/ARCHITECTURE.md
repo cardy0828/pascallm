@@ -1,5 +1,7 @@
 # 実装構成
 
+[English](ARCHITECTURE.en.md)
+
 | 場所 | 役割 |
 | --- | --- |
 | cmd/pascallm-server | APIサーバー起動・設定 |

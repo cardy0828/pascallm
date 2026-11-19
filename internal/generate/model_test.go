@@ -5,6 +5,7 @@ import (
 	"github.com/cardy0828/pascallm/internal/gpucore"
 	"github.com/cardy0828/pascallm/internal/grammar"
 	"github.com/cardy0828/pascallm/internal/sampling"
+	"slices"
 	"testing"
 )
 
@@ -16,6 +17,9 @@ type fakeModel struct {
 
 // VocabSize は試験用語彙数を返します。
 func (m *fakeModel) VocabSize() int { return 256 }
+
+// PrefillChunkSize はテスト用モデルの区切り（512 個）を返します。
+func (m *fakeModel) PrefillChunkSize() int { return 512 }
 
 // MaxContext は試験の文脈上限です。
 func (m *fakeModel) MaxContext() int { return 8192 }
@@ -116,5 +120,33 @@ func TestGreedyBanFallback(t *testing.T) {
 	}
 	if chosen != 2 || m.copies != 1 || result.FullLogitsSteps != 1 || m.position != 1 {
 		t.Fatalf("chosen=%d copies=%d position=%d result=%+v", chosen, m.copies, m.position, result)
+	}
+}
+
+// chunkModel は API と同じ生成経路で各 Prefill 呼び出しの行数を記録する。
+type chunkModel struct {
+	fakeModel
+	chunks []int
+}
+
+// PrefillChunkSize は境界の端数も検査できるように 3 を返す。
+func (m *chunkModel) PrefillChunkSize() int { return 3 }
+
+// Prefill は処理した行数を残し、試験用モデルの位置も進める。
+func (m *chunkModel) Prefill(ids []int) error {
+	m.chunks = append(m.chunks, len(ids))
+	return m.fakeModel.Prefill(ids)
+}
+
+// TestFeedPromptUsesModelChunk は 7 トークンを 3・3・1 行に分割し、最後の入力を別に扱うことを確かめる。
+func TestFeedPromptUsesModelChunk(t *testing.T) {
+	model := &chunkModel{}
+	engine, err := New(model, 256, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = engine.Generate(context.Background(), Request{Prompt: []int{1, 2, 3, 4, 5, 6, 7, 8}, MaxTokens: 1, Sampling: sampling.Params{RepetitionPenalty: 1, TopP: 1}}, func(int) (bool, error) { return false, nil })
+	if err != nil || !slices.Equal(model.chunks, []int{3, 3, 1}) {
+		t.Fatalf("chunks %v, error %v", model.chunks, err)
 	}
 }

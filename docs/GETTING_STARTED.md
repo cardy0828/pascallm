@@ -1,5 +1,7 @@
 # 導入・変換・検証
 
+[English](GETTING_STARTED.en.md)
+
 ## 配置
 
 すべてリポジトリのルートから実行します。実行例は Linux の bash です。

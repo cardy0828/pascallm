@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/cardy0828/pascallm/internal/cuda"
@@ -47,8 +48,12 @@ func TestKVAttentionGPU(t *testing.T) {
 		}
 		for _, c := range []struct {
 			name                     string
+			kernel                   string
 			dim, heads, ring, window int
-		}{{"local", 256, 2, 32, 19}, {"global", 512, 4, 64, 0}} {
+		}{{"local", "g4_attention_local_rows", 256, 2, 32, 19}, {"global", "g4_attention_global_rows", 512, 4, 64, 0}, {"prefill-local", "g4_prefill_local_ring", 256, 2, 32, 19}, {"prefill-global", "g4_prefill_global8", 512, 8, 64, 0}} {
+			if format != "fp16" && strings.HasPrefix(c.kernel, "g4_prefill_") {
+				continue
+			}
 			t.Logf("format=%s attention=%s", format, c.name)
 			// t.Run は別 goroutine のため使わず、CUDA context を持つ同じ OS thread で検査する。
 			func() {
@@ -75,7 +80,7 @@ func TestKVAttentionGPU(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer cuda.Free(out)
-				function, err := module.Function("g4_attention_" + c.name + "_rows")
+				function, err := module.Function(c.kernel)
 				if err != nil {
 					t.Fatal(err)
 				}

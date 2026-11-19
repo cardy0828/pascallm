@@ -222,7 +222,7 @@ func (e *Engine) Generate(ctx context.Context, request Request, handler TokenHan
 }
 
 // feedPrompt は、プロンプトの最後の 1 個を除いたトークン列 tokens を入れます。batchPrefill なら
-// prefillChunkTokens 個ずつ Prefill し、そうでなければ 1 個ずつ Feed します。区切りごとに ctx を確かめ、
+// モデルの区切りごとに Prefill し、そうでなければ 1 個ずつ Feed します。区切りごとに ctx を確かめ、
 // 取り消されたらそこまでで止めます（入れた分は e.cached に記録済みで、KV キャッシュは正しいまま）。
 // GPU の処理が失敗した場合は、KV キャッシュを捨てたうえでエラーを返します。
 func (e *Engine) feedPrompt(ctx context.Context, tokens []int) error {
@@ -233,7 +233,7 @@ func (e *Engine) feedPrompt(ctx context.Context, tokens []int) error {
 		}
 		count := 1
 		if e.batchPrefill {
-			count = min(len(pending), prefillChunkTokens)
+			count = min(len(pending), e.model.PrefillChunkSize())
 		}
 		part := pending[:count]
 		if e.batchPrefill {
